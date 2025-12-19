@@ -95,6 +95,51 @@ def safe_float(val, default=0):
         return default
 
 
+def normalize_tract(val):
+    """Normalize a tract value to a consistent string format."""
+    if val is None or pd.isna(val):
+        return ''
+    val_str = str(val).strip()
+    # If it's a numeric value like "1.0", convert to "1"
+    try:
+        num = float(val_str)
+        if num == int(num):
+            return str(int(num))
+        return val_str
+    except (ValueError, TypeError):
+        return val_str
+
+
+def tract_sort_key(tract):
+    """Create a sort key for tract numbers that handles both numeric and text tracts.
+
+    Sorts numerically for pure numbers, alphabetically for text tracts.
+    Examples: 1, 2, 10, 11, Oram 1, Oram 2, Oram 10
+    """
+    import re
+    tract_str = str(tract)
+
+    # Try to parse as a pure number first
+    try:
+        num = float(tract_str)
+        # Pure numbers sort first, using a tuple (0, number, '')
+        return (0, num, '')
+    except (ValueError, TypeError):
+        pass
+
+    # For text tracts, extract any trailing number for natural sorting
+    # e.g., "Oram 10" -> ("Oram ", 10)
+    match = re.match(r'^(.*?)(\d+)$', tract_str)
+    if match:
+        prefix = match.group(1)
+        num = int(match.group(2))
+        # Text tracts sort after numbers, using tuple (1, prefix, number)
+        return (1, prefix.lower(), num)
+
+    # Pure text with no numbers
+    return (1, tract_str.lower(), 0)
+
+
 def load_combined_data(uploaded_file):
     """Load and validate the Combined data file."""
     try:
@@ -124,10 +169,9 @@ def load_combined_data(uploaded_file):
         if missing:
             return None, f"Missing required columns: {', '.join(missing)}"
         
-        # Clean up TRACT column
-        df['TRACT'] = pd.to_numeric(df['TRACT'], errors='coerce')
-        df = df.dropna(subset=['TRACT'])
-        df['TRACT'] = df['TRACT'].astype(int)
+        # Clean up TRACT column - normalize to consistent string format
+        df['TRACT'] = df['TRACT'].apply(normalize_tract)
+        df = df[df['TRACT'] != '']  # Remove empty tract values
         
         return df, None
         
@@ -157,18 +201,17 @@ def load_tract_allocations(uploaded_file):
             tract = row[0]
             if pd.isna(tract) or str(tract).strip().upper() == 'TOTAL UNIT ACRES':
                 break
-            try:
-                tract_num = int(float(tract))
-                allocation = safe_float(row[3], 0)  # Tract Allocation column
-                acres = safe_float(row[2], 0)  # Acres column
-                legal_desc = str(row[1]) if pd.notna(row[1]) else ''
-                allocations[tract_num] = {
-                    'allocation': allocation,
-                    'acres': acres,
-                    'legal_description': legal_desc
-                }
-            except:
+            tract_key = normalize_tract(tract)
+            if tract_key == '':
                 continue
+            allocation = safe_float(row[3], 0)  # Tract Allocation column
+            acres = safe_float(row[2], 0)  # Acres column
+            legal_desc = str(row[1]) if pd.notna(row[1]) else ''
+            allocations[tract_key] = {
+                'allocation': allocation,
+                'acres': acres,
+                'legal_description': legal_desc
+            }
         
         if not allocations:
             return None, "No tract allocations found in file"
@@ -201,7 +244,7 @@ def create_tract_based_workbook(df):
     for tract in df['TRACT'].unique():
         tract_data = df[df['TRACT'] == tract].iloc[0] if len(df[df['TRACT'] == tract]) > 0 else None
         if tract_data is not None:
-            tract_info[int(tract)] = {
+            tract_info[tract] = {
                 'legal_description': str(tract_data.get('Legal Description', '')) if pd.notna(tract_data.get('Legal Description')) else '',
                 'gross_acres': safe_float(tract_data.get('Tract Gross Acres', tract_data.get('NET ACRES', 0)))
             }
@@ -221,13 +264,12 @@ def create_tract_based_workbook(df):
         cell.alignment = center_align
         cell.border = thin_border
     
-    ws.column_dimensions['A'].width = 10
+    ws.column_dimensions['A'].width = 15
     ws.column_dimensions['B'].width = 60
     ws.column_dimensions['C'].width = 15
     
     row_num = 2
-    for tract in sorted(df['TRACT'].unique()):
-        tract = int(tract)
+    for tract in sorted(df['TRACT'].unique(), key=tract_sort_key):
         info = tract_info.get(tract, {'legal_description': '', 'gross_acres': 0})
         ws.cell(row=row_num, column=1, value=tract).font = tnr_font
         ws.cell(row=row_num, column=1).alignment = center_align
@@ -253,12 +295,11 @@ def create_tract_based_workbook(df):
         ('ORI', 'ORI', 'Overriding Royalty Interests'),
         ('WI', 'WI', 'Working Interests')
     ]
-    
+
     # Build LORI lookup for WI sheet
     lori_lookup = {}
     mi_df = df[df['TYPE'] == 'MI']
     for tract in mi_df['TRACT'].unique():
-        tract = int(tract)
         tract_mi = mi_df[mi_df['TRACT'] == tract]
         lori_lookup[tract] = {}
         for _, row in tract_mi.iterrows():
@@ -268,7 +309,7 @@ def create_tract_based_workbook(df):
                 lori_lookup[tract][lease] = lori
             if 'default' not in lori_lookup[tract]:
                 lori_lookup[tract]['default'] = lori
-    
+
     for type_code, sheet_name, full_name in interest_types:
         type_df = df[df['TYPE'] == type_code].copy()
         
@@ -319,9 +360,8 @@ def create_tract_based_workbook(df):
         
         # Process data BY TRACT
         current_row = 2
-        
-        for tract in sorted(type_df['TRACT'].unique()):
-            tract = int(tract)
+
+        for tract in sorted(type_df['TRACT'].unique(), key=tract_sort_key):
             tract_data = type_df[type_df['TRACT'] == tract].sort_values('OWNER')
             info = tract_info.get(tract, {'legal_description': '', 'gross_acres': 0})
             
@@ -482,7 +522,7 @@ def create_tract_based_workbook(df):
     ws = wb.create_sheet('Unit Recap')
     
     headers = ['TRACT', 'LORI NRI', 'NPRI NRI', 'ORI NRI', 'WI NRI', 'TOTAL NRI']
-    col_widths = [10, 14, 14, 14, 14, 14]
+    col_widths = [15, 14, 14, 14, 14, 14]
     
     for col, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -496,9 +536,8 @@ def create_tract_based_workbook(df):
     
     current_row = 2
     totals = {'MI': 0, 'NPRI': 0, 'ORI': 0, 'WI': 0}
-    
-    for tract in sorted(df['TRACT'].unique()):
-        tract = int(tract)
+
+    for tract in sorted(df['TRACT'].unique(), key=tract_sort_key):
         lori_nri = sum(safe_float(r.get('TRACT NRI', 0)) for _, r in df[(df['TYPE'] == 'MI') & (df['TRACT'] == tract)].iterrows())
         npri_nri = sum(safe_float(r.get('TRACT NRI', 0)) for _, r in df[(df['TYPE'] == 'NPRI') & (df['TRACT'] == tract) & (~df['OWNER'].astype(str).str.lower().str.strip().isin(['none.', 'none']))].iterrows())
         ori_nri = sum(safe_float(r.get('TRACT NRI', 0)) for _, r in df[(df['TYPE'] == 'ORI') & (df['TRACT'] == tract)].iterrows())
@@ -543,9 +582,39 @@ def create_tract_based_workbook(df):
     return wb
 
 
-def create_unit_based_workbook(df, allocations):
+def create_unit_based_workbook(df, allocations, schedule_file):
     """Create a Unit-Based DOI Excel workbook (organized by owner)."""
     wb = Workbook()
+
+    # Copy the Tract List sheet from the schedule file as the first sheet
+    from openpyxl import load_workbook
+    schedule_file.seek(0)  # Reset file pointer
+    source_wb = load_workbook(schedule_file)
+    if 'Tract List' in source_wb.sheetnames:
+        source_ws = source_wb['Tract List']
+        # Rename the default sheet to 'Tract List'
+        ws = wb.active
+        ws.title = 'Tract List'
+        # Copy all cells from source to destination
+        for row in source_ws.iter_rows():
+            for cell in row:
+                new_cell = ws.cell(row=cell.row, column=cell.column, value=cell.value)
+                if cell.has_style:
+                    new_cell.font = cell.font.copy()
+                    new_cell.border = cell.border.copy()
+                    new_cell.fill = cell.fill.copy()
+                    new_cell.number_format = cell.number_format
+                    new_cell.protection = cell.protection.copy()
+                    new_cell.alignment = cell.alignment.copy()
+        # Copy column widths
+        for col_letter, col_dim in source_ws.column_dimensions.items():
+            ws.column_dimensions[col_letter].width = col_dim.width
+        # Copy row heights
+        for row_num, row_dim in source_ws.row_dimensions.items():
+            ws.row_dimensions[row_num].height = row_dim.height
+        # Copy merged cells
+        for merged_range in source_ws.merged_cells.ranges:
+            ws.merge_cells(str(merged_range))
     
     # Styles
     tnr_font = Font(name='Times New Roman', size=10)
@@ -562,16 +631,6 @@ def create_unit_based_workbook(df, allocations):
     wrap_align = Alignment(wrap_text=True, vertical='bottom', horizontal='left')
     narrow_margins = PageMargins(left=0.25, right=0.25, top=0.75, bottom=0.75)
     
-    def get_owner_row1_border(col, total_cols):
-        left = medium_side if col == 1 else no_side
-        right = medium_side if col == total_cols else no_side
-        return Border(left=left, right=right, top=medium_side, bottom=no_side)
-    
-    def get_owner_row2_border(col, total_cols):
-        left = medium_side if col == 1 else no_side
-        right = medium_side if col == total_cols else no_side
-        return Border(left=left, right=right, top=no_side, bottom=medium_side)
-    
     # Filter to only tracts in allocations
     valid_tracts = list(allocations.keys())
     df = df[df['TRACT'].isin(valid_tracts)].copy()
@@ -580,7 +639,6 @@ def create_unit_based_workbook(df, allocations):
     lori_lookup = {}
     mi_df = df[df['TYPE'] == 'MI']
     for tract in mi_df['TRACT'].unique():
-        tract = int(tract)
         tract_mi = mi_df[mi_df['TRACT'] == tract]
         lori_lookup[tract] = {}
         for _, row in tract_mi.iterrows():
@@ -590,7 +648,7 @@ def create_unit_based_workbook(df, allocations):
                 lori_lookup[tract][lease] = lori
             if 'default' not in lori_lookup[tract]:
                 lori_lookup[tract]['default'] = lori
-    
+
     interest_types = [
         ('MI', 'LORI', 'Landowner Royalty Interests'),
         ('NPRI', 'NPRI', 'Non-Participating Royalty Interests'),
@@ -598,22 +656,16 @@ def create_unit_based_workbook(df, allocations):
         ('WI', 'WI', 'Working Interests')
     ]
     
-    first_sheet = True
     for type_code, sheet_name, full_name in interest_types:
         type_df = df[df['TYPE'] == type_code].copy()
-        
+
         # Filter out "None." owners
         type_df = type_df[~type_df['OWNER'].astype(str).str.lower().str.strip().isin(['none.', 'none', 'nan', ''])]
-        
+
         if type_df.empty:
             continue
-        
-        if first_sheet:
-            ws = wb.active
-            ws.title = sheet_name
-            first_sheet = False
-        else:
-            ws = wb.create_sheet(sheet_name)
+
+        ws = wb.create_sheet(sheet_name)
         
         # Define headers - include UNIT NRI column
         if type_code == 'MI':
@@ -667,40 +719,26 @@ def create_unit_based_workbook(df, allocations):
             ws.cell(row=current_row, column=1).font = tnr_bold
             ws.cell(row=current_row, column=1).fill = owner_fill
             ws.cell(row=current_row, column=1).alignment = bottom_align
-            
+
             ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=len(headers))
             ws.cell(row=current_row, column=2, value=str(owner))
             ws.cell(row=current_row, column=2).font = tnr_font
             ws.cell(row=current_row, column=2).fill = owner_fill
             ws.cell(row=current_row, column=2).alignment = wrap_align
-            
+
+            # Apply border with both top and bottom medium borders for single-row owner box
             for col in range(1, len(headers) + 1):
-                ws.cell(row=current_row, column=col).border = get_owner_row1_border(col, len(headers))
+                left = medium_side if col == 1 else no_side
+                right = medium_side if col == len(headers) else no_side
+                ws.cell(row=current_row, column=col).border = Border(left=left, right=right, top=medium_side, bottom=medium_side)
                 ws.cell(row=current_row, column=col).fill = owner_fill
-            
-            current_row += 1
-            
-            # Address row (placeholder)
-            ws.cell(row=current_row, column=1, value='Address:')
-            ws.cell(row=current_row, column=1).font = tnr_bold
-            ws.cell(row=current_row, column=1).fill = owner_fill
-            ws.cell(row=current_row, column=1).alignment = bottom_align
-            
-            ws.merge_cells(start_row=current_row, start_column=2, end_row=current_row, end_column=len(headers))
-            ws.cell(row=current_row, column=2, value='')
-            ws.cell(row=current_row, column=2).font = tnr_font
-            ws.cell(row=current_row, column=2).fill = owner_fill
-            
-            for col in range(1, len(headers) + 1):
-                ws.cell(row=current_row, column=col).border = get_owner_row2_border(col, len(headers))
-                ws.cell(row=current_row, column=col).fill = owner_fill
-            
+
             current_row += 1
             current_row += 1  # Blank row after owner info
             
             # Data rows
             for idx, (_, row) in enumerate(owner_data.iterrows()):
-                tract = int(row['TRACT'])
+                tract = row['TRACT']
                 allocation = allocations.get(tract, {}).get('allocation', 0)
                 tract_nri = safe_float(row.get('TRACT NRI', 0))
                 unit_nri = tract_nri * allocation
@@ -782,7 +820,7 @@ def create_unit_based_workbook(df, allocations):
             ws.cell(row=current_row, column=1).border = thin_border
             
             unit_nri_total = sum(
-                safe_float(r.get('TRACT NRI', 0)) * allocations.get(int(r['TRACT']), {}).get('allocation', 0)
+                safe_float(r.get('TRACT NRI', 0)) * allocations.get(r['TRACT'], {}).get('allocation', 0)
                 for _, r in owner_data.iterrows()
             )
             
@@ -814,7 +852,7 @@ def create_unit_based_workbook(df, allocations):
     ws = wb.create_sheet('Unit Recap')
     
     headers = ['TRACT', 'LORI NRI', 'NPRI NRI', 'ORI NRI', 'WI NRI', 'TOTAL NRI']
-    col_widths = [10, 14, 14, 14, 14, 14]
+    col_widths = [15, 14, 14, 14, 14, 14]
     
     for col, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -828,8 +866,8 @@ def create_unit_based_workbook(df, allocations):
     
     current_row = 2
     totals = {'MI': 0, 'NPRI': 0, 'ORI': 0, 'WI': 0}
-    
-    for tract in sorted(allocations.keys()):
+
+    for tract in sorted(allocations.keys(), key=tract_sort_key):
         allocation = allocations[tract]['allocation']
         
         lori_nri = sum(safe_float(r.get('TRACT NRI', 0)) * allocation for _, r in df[(df['TYPE'] == 'MI') & (df['TRACT'] == tract)].iterrows())
@@ -992,7 +1030,7 @@ def main():
                         with st.expander("View Tract Allocations"):
                             alloc_df = pd.DataFrame([
                                 {'Tract': k, 'Allocation': v['allocation'], 'Acres': v['acres']}
-                                for k, v in sorted(allocations.items())
+                                for k, v in sorted(allocations.items(), key=lambda x: tract_sort_key(x[0]))
                             ])
                             st.dataframe(alloc_df, use_container_width=True)
                 else:
@@ -1017,7 +1055,7 @@ def main():
                                 """, unsafe_allow_html=True)
                                 
                             else:  # Unit-Based DOI
-                                wb, total_nri = create_unit_based_workbook(df, allocations)
+                                wb, total_nri = create_unit_based_workbook(df, allocations, schedule_file)
                                 filename = "Unit_Based_DOI.xlsx"
                                 
                                 # Show validation
